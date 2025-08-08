@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scannibal</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <button id="theme-toggle" class="theme-toggle" aria-label="Toggle theme" aria-pressed="false">🌙</button>
+  <div class="wrap">
+    <div class="card">
+      <h1 class="brand">
+        <span id="brand-text"></span>
+        <span id="brand-version" class="brand-version"></span>
+      </h1>
+      <form id="form">
+        <div class="input">
+          <input id="data" type="text" placeholder="Enter text to encode…" autocomplete="off" required />
+        </div>
+        <div class="row">
+          <label>
+            Type
+            <select id="type">
+              <option value="qr">QR</option>
+              <option value="datamatrix">Data Matrix</option>
+              <option value="code128">Code128</option>
+              <option value="ean13">EAN-13</option>
+              <option value="upca">UPC-A</option>
+              <option value="code39">Code39</option>
+              <option value="itf">ITF</option>
+            </select>
+          </label>
+          <label>
+            Format
+            <select id="fmt">
+              <option value="png">PNG</option>
+              <option value="svg">SVG</option>
+            </select>
+          </label>
+          <label class="chk" id="show-text-wrap">
+            <input id="txt" type="checkbox" checked /> show text
+          </label>
+          <label class="chk" id="micro-wrap" style="display:none">
+            <input id="micro" type="checkbox" /> Micro QR
+          </label>
+        </div>
+        <div class="actions">
+          <button id="go" type="submit">Generate</button>
+          <button id="download-btn" type="button" title="Download" style="display:none">⬇️</button>
+        </div>
+      </form>
+      <div class="seg">Seglectic Systems</div>
+      <div id="result" class="result"></div>
+    </div>
+  </div>
+
+  <script>
+    function utf8ByteLength(str) {
+      // Quick UTF-8 byte length calc
+      let bytes = 0;
+      for (let i = 0; i < str.length; i++) {
+        const codePoint = str.codePointAt(i);
+        if (codePoint <= 0x7F) bytes += 1;
+        else if (codePoint <= 0x7FF) bytes += 2;
+        else if (codePoint <= 0xFFFF) bytes += 3;
+        else { bytes += 4; i++; }
+      }
+      return bytes;
+    }
+
+    // Returns { ok:boolean, cleaned:string, error?:string }
+    function sanitize(kind, data) {
+      const original = data;
+      if (!data) return { ok: false, cleaned: '', error: 'Input is empty' };
+
+      if (kind === 'qr') {
+        const max = 2953; // bytes, QR byte mode limit (approx)
+        const len = utf8ByteLength(data);
+        if (len > max) return { ok: false, cleaned: '', error: `QR data too long (${len} bytes). Max ~${max}.` };
+        return { ok: true, cleaned: data };
+      }
+
+      if (kind === 'datamatrix') {
+        // Data Matrix max 1556 bytes (full symbol, byte mode)
+        const max = 1556;
+        const len = utf8ByteLength(data);
+        if (len > max) return { ok: false, cleaned: '', error: `Data Matrix too long (${len} bytes). Max ~${max}.` };
+        return { ok: true, cleaned: data };
+      }
+
+      if (kind === 'ean13') {
+        const digits = data.replace(/\D/g, '');
+        if (digits.length < 12) return { ok: false, cleaned: '', error: 'EAN-13 needs 12 digits (13th checksum auto).' };
+        if (digits.length > 13) return { ok: false, cleaned: '', error: 'EAN-13 max is 13 digits.' };
+        // Accept 12 (checksum computed) or 13 (explicit)
+        return { ok: true, cleaned: digits.slice(0, 13) };
+      }
+
+      if (kind === 'upca') {
+        const digits = data.replace(/\D/g, '');
+        if (digits.length !== 11 && digits.length !== 12) return { ok: false, cleaned: '', error: 'UPC-A must be 11 digits (checksum auto) or 12 digits (with checksum).' };
+        return { ok: true, cleaned: digits.slice(0, 12) };
+      }
+
+      if (kind === 'itf') {
+        const digits = data.replace(/\D/g, '');
+        if (digits.length < 2) return { ok: false, cleaned: '', error: 'ITF needs at least 2 digits.' };
+        if (digits.length % 2 !== 0) return { ok: false, cleaned: '', error: 'ITF requires an even number of digits.' };
+        return { ok: true, cleaned: digits };
+      }
+
+      if (kind === 'code39') {
+        let cleaned = data.toUpperCase().trim();
+        const ok = /^[0-9A-Z \-.\$\/\+%]*$/.test(cleaned);
+        if (!ok) return { ok: false, cleaned: '', error: 'Code39 allows A–Z, 0–9, space, - . $ / + %' };
+        if (cleaned.length > 100) return { ok: false, cleaned: '', error: 'Code39 max 100 chars (practical limit).' };
+        return { ok: true, cleaned };
+      }
+
+      if (kind === 'code128') {
+        // Allow broad ASCII range; keep a sane cap for label width
+        const cleaned = data.trim();
+        if (cleaned.length > 200) return { ok: false, cleaned: '', error: 'Code128 max 200 chars (practical limit).' };
+        return { ok: true, cleaned };
+      }
+
+      return { ok: false, cleaned: '', error: 'Unsupported type' };
+    }
+
+    const form   = document.getElementById('form');
+    const input  = document.getElementById('data');
+    const typeEl = document.getElementById('type');
+    const fmtEl  = document.getElementById('fmt');
+    const txtEl  = document.getElementById('txt');
+    const result = document.getElementById('result');
+    const dlBtn  = document.getElementById('download-btn');
+    const microEl = document.getElementById('micro');
+    const showTextWrap = document.getElementById('show-text-wrap');
+    const microWrap = document.getElementById('micro-wrap');
+    let currentBlobUrl = null;
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const data = input.value.trim();
+      if (!data) return;
+      const type = typeEl.value;
+      const fmt = fmtEl.value;
+      const txt = txtEl.checked;
+      const micro = microEl ? microEl.checked : false;
+
+      // sanitize input based on type
+      const s = sanitize(type, data);
+      if (!s.ok) {
+        result.innerHTML = '';
+        const pre = document.createElement('pre');
+        pre.textContent = 'Error: ' + s.error;
+        result.appendChild(pre);
+        return;
+      }
+      const cleaned = s.cleaned;
+
+      const btn = document.getElementById('go');
+      btn.disabled = true; btn.textContent = 'Working…';
+      result.innerHTML = '';
+
+        // hide download and revoke old blob URL
+        dlBtn.style.display = 'none';
+        if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
+
+      try {
+        const url = new URL('/code', window.location.origin);
+        url.searchParams.set('data', cleaned);
+        url.searchParams.set('type', type);
+        url.searchParams.set('fmt', fmt);
+        url.searchParams.set('txt', String(txt));
+        url.searchParams.set('micro', String(micro));
+
+        const res = await fetch(url, { method: 'GET' });
+        if (!res.ok) {
+          const msg = await res.text();
+          throw new Error(msg || ('HTTP ' + res.status));
+        }
+        const ct = res.headers.get('content-type') || '';
+        const blob = await res.blob();
+
+        // Create/reuse object URL so we can also download it
+        currentBlobUrl = URL.createObjectURL(blob);
+
+        // Render image
+        const img = document.createElement('img');
+        img.alt = 'Generated code';
+        img.src = currentBlobUrl;
+        result.appendChild(img);
+
+        // Prepare download filename and show button
+        const ext = (fmt === 'svg' || ct.includes('svg')) ? 'svg' : 'png';
+        const base = `${type}-${cleaned}`.replace(/[^A-Za-z0-9._-]+/g, '_');
+        dlBtn.dataset.filename = `${base}.${ext}`;
+        dlBtn.style.display = '';
+      } catch (err) {
+        const pre = document.createElement('pre');
+        pre.textContent = 'Error: ' + (err?.message || err);
+        result.appendChild(pre);
+      } finally {
+        btn.disabled = false; btn.textContent = 'Generate';
+      }
+    });
+
+    function initTheme() {
+      const theme = localStorage.getItem('theme');
+      if (theme === 'dark') {
+        document.documentElement.classList.add('dark');
+        toggleBtn.textContent = '☀️';
+        toggleBtn.setAttribute('aria-pressed', 'true');
+      } else {
+        document.documentElement.classList.remove('dark');
+        toggleBtn.textContent = '🌙';
+        toggleBtn.setAttribute('aria-pressed', 'false');
+      }
+    }
+
+    function toggleTheme() {
+      if (document.documentElement.classList.contains('dark')) {
+        document.documentElement.classList.remove('dark');
+        localStorage.setItem('theme', 'light');
+        toggleBtn.textContent = '🌙';
+        toggleBtn.setAttribute('aria-pressed', 'false');
+      } else {
+        document.documentElement.classList.add('dark');
+        localStorage.setItem('theme', 'dark');
+        toggleBtn.textContent = '☀️';
+        toggleBtn.setAttribute('aria-pressed', 'true');
+      }
+    }
+
+    let toggleBtn;
+
+    // Autofocus input on load and setup theme toggle
+    window.addEventListener('DOMContentLoaded', () => {
+      input.focus();
+      toggleBtn = document.getElementById('theme-toggle');
+      toggleBtn.addEventListener('click', toggleTheme);
+      dlBtn.addEventListener('click', () => {
+        if (!currentBlobUrl) return;
+        const a = document.createElement('a');
+        a.href = currentBlobUrl;
+        a.download = dlBtn.dataset.filename || 'code.png';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      });
+      initTheme();
+
+
+      // typewriter for H1 + version in one interval
+      const brand   = document.getElementById("brand-text");
+      const verEl   = document.getElementById("brand-version");
+      const nameStr = "Scannibal";
+      let verStr = "";         // will become like "v0.1.0"
+      let i = 0, j = 0;
+
+      // fetch version; when ready we’ll type it after the name
+      fetch("/version").then(r => r.json()).then(d => {
+        verStr = `v${d.version}`;
+      });
+
+      // ensure clean start
+      brand.textContent = "";
+      verEl.textContent = "";
+
+      const typer = setInterval(() => {
+        // 1) type the name
+        if (i < nameStr.length) {
+          brand.textContent += nameStr[i++];
+          return;
+        }
+        // 2) wait until version string is available
+        if (!verStr) return;
+
+        // 3) type the version
+        if (j < verStr.length) {
+          verEl.textContent += verStr[j++];
+          if (j >= verStr.length) clearInterval(typer);
+        }
+      }, 30);
+
+      function updateOptionVisibility() {
+        const kind = typeEl.value;
+        const isQR = kind === 'qr';
+        const is2D = kind === 'qr' || kind === 'datamatrix';
+        // Show text only for 1D barcodes
+        showTextWrap.style.display = is2D ? 'none' : '';
+        // Micro QR only for QR
+        microWrap.style.display = isQR ? '' : 'none';
+
+        // Data Matrix is PNG-only (backend 406 on SVG). Auto-switch & disable SVG when selected.
+        const svgOpt = document.querySelector('#fmt option[value="svg"]');
+        if (svgOpt) {
+          if (kind === 'datamatrix') {
+            svgOpt.disabled = true;
+            if (fmtEl.value === 'svg') fmtEl.value = 'png';
+          } else {
+            svgOpt.disabled = false;
+          }
+        }
+      }
+      typeEl.addEventListener('change', updateOptionVisibility);
+      updateOptionVisibility();
+
+  });
+  </script>
+</body>
+</html>
